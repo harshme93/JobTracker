@@ -249,6 +249,12 @@ def main():
     else:
         print("No new jobs. No notification sent.")
 
+    # Save last run timestamp
+    db.collection("settings").document("last_run").set({
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "jobs_found": len(new_jobs),
+    })
+
     print("\nDone.")
 
 
