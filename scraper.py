@@ -4,8 +4,8 @@ Reads company configs + global titles from Firebase, scrapes career pages,
 detects new jobs matching title keywords, sends email alerts.
 
 Supported platforms:
-- Eightfold AI (e.g. Liberty Mutual)
-- Workday (e.g. Nationwide, Travelers, Allstate, CNA, Markel)
+- Eightfold AI (e.g. Liberty Mutual) — searches per keyword
+- Workday (e.g. Nationwide, Travelers, Allstate, CNA, Markel) — searches per keyword
 - iCIMS (e.g. Mercury Insurance)
 - Oracle HCM (e.g. Chubb)
 - Generic fallback (link parsing)
@@ -19,7 +19,7 @@ import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlencode, urlparse, parse_qs
 
 import firebase_admin
 from firebase_admin import credentials, firestore
@@ -43,7 +43,6 @@ SMTP_PASS = os.environ.get("SMTP_PASS", "")
 
 
 def get_config():
-    """Read companies, global titles, and notification email from Firebase."""
     companies = []
     docs = db.collection("companies").stream()
     for d in docs:
@@ -54,13 +53,11 @@ def get_config():
             "url": data.get("url", ""),
         })
 
-    # Global titles
     titles_doc = db.collection("settings").document("titles").get()
     titles = []
     if titles_doc.exists:
         titles = titles_doc.to_dict().get("list", [])
 
-    # Notification email
     settings_doc = db.collection("settings").document("notification").get()
     email = ""
     if settings_doc.exists:
@@ -84,7 +81,6 @@ def save_seen_jobs(seen_ids):
 
 
 def detect_platform(url):
-    """Detect which ATS platform a URL belongs to."""
     url_lower = url.lower()
     if "eightfold" in url_lower or "searchjobs." in url_lower:
         return "eightfold"
@@ -94,178 +90,295 @@ def detect_platform(url):
         return "icims"
     if "oraclecloud.com" in url_lower:
         return "oracle"
-    if "jobs.ajg.com" in url_lower or "jobs.statefarm.com" in url_lower:
-        return "generic_js"
     return "generic"
 
 
-def scrape_eightfold(page, url):
-    """Extract jobs from Eightfold AI career sites."""
-    try:
-        page.goto(url, wait_until="networkidle", timeout=30000)
-        page.wait_for_timeout(3000)
-    except Exception as e:
-        print(f"  Error loading: {e}")
-        return []
+# ─────────────────────────────────────────────
+# EIGHTFOLD — searches per keyword via URL
+# ─────────────────────────────────────────────
+def scrape_eightfold(page, base_url, titles):
+    """Eightfold: append each keyword to the URL and extract positions."""
+    all_jobs = []
+    seen_titles = set()
 
-    try:
-        jobs = page.evaluate("""
-            () => {
-                const scripts = document.querySelectorAll('script');
-                for (const script of scripts) {
-                    const text = script.textContent || '';
-                    if (text.includes('"positions"')) {
-                        const match = text.match(/"positions"\\s*:\\s*(\\[.*?\\])\\s*[,}]/s);
-                        if (match) {
-                            try {
-                                const positions = JSON.parse(match[1]);
-                                return positions.map(p => ({
-                                    title: p.name || p.posting_name || '',
-                                    link: p.canonicalPositionUrl || '',
-                                    id: String(p.id || '')
-                                }));
-                            } catch(e) {}
+    for keyword in titles:
+        search_url = base_url + keyword.replace(" ", "+")
+        print(f"    Searching: {keyword}")
+        try:
+            page.goto(search_url, wait_until="networkidle", timeout=30000)
+            page.wait_for_timeout(3000)
+        except Exception as e:
+            print(f"    Error loading: {e}")
+            continue
+
+        try:
+            jobs = page.evaluate("""
+                () => {
+                    const scripts = document.querySelectorAll('script');
+                    for (const script of scripts) {
+                        const text = script.textContent || '';
+                        if (text.includes('"positions"')) {
+                            const match = text.match(/"positions"\\s*:\\s*(\\[.*?\\])\\s*[,}]/s);
+                            if (match) {
+                                try {
+                                    const positions = JSON.parse(match[1]);
+                                    return positions.map(p => ({
+                                        title: p.name || p.posting_name || '',
+                                        link: p.canonicalPositionUrl || ''
+                                    }));
+                                } catch(e) {}
+                            }
                         }
                     }
+                    return [];
                 }
-                return [];
-            }
-        """)
-        print(f"  Eightfold: {len(jobs)} positions found")
-        return jobs or []
-    except Exception as e:
-        print(f"  Eightfold parse error: {e}")
-        return []
+            """)
+            for job in (jobs or []):
+                key = job["title"] + "|" + job.get("link", "")
+                if key not in seen_titles:
+                    seen_titles.add(key)
+                    all_jobs.append(job)
+            print(f"    Found {len(jobs or [])} positions")
+        except Exception as e:
+            print(f"    Parse error: {e}")
+
+    print(f"  Eightfold total: {len(all_jobs)} unique positions")
+    return all_jobs
 
 
-def scrape_workday(page, url):
-    """Extract jobs from Workday career sites."""
-    try:
-        page.goto(url, wait_until="networkidle", timeout=30000)
-        page.wait_for_timeout(3000)
-    except Exception as e:
-        print(f"  Error loading: {e}")
-        return []
+# ─────────────────────────────────────────────
+# WORKDAY — searches per keyword using search input
+# ─────────────────────────────────────────────
+def scrape_workday(page, base_url, titles):
+    """Workday: use the search box to search each keyword."""
+    all_jobs = []
+    seen_titles = set()
 
-    try:
-        jobs = page.evaluate("""
-            () => {
-                const results = [];
-                // Workday renders job cards as <a> tags with data-automation-id
-                const jobLinks = document.querySelectorAll('a[data-automation-id="jobTitle"]');
-                if (jobLinks.length > 0) {
-                    for (const link of jobLinks) {
-                        results.push({
-                            title: (link.textContent || '').trim(),
-                            link: link.href || ''
-                        });
+    for keyword in titles:
+        print(f"    Searching: {keyword}")
+        try:
+            page.goto(base_url, wait_until="networkidle", timeout=30000)
+            page.wait_for_timeout(2000)
+
+            # Find and fill search input
+            search_input = page.query_selector('input[data-automation-id="searchBox"]')
+            if not search_input:
+                search_input = page.query_selector('input[aria-label*="Search"]')
+            if not search_input:
+                search_input = page.query_selector('input[type="text"]')
+
+            if search_input:
+                search_input.click()
+                search_input.fill("")
+                search_input.fill(keyword)
+                page.keyboard.press("Enter")
+                page.wait_for_timeout(3000)
+                try:
+                    page.wait_for_load_state("networkidle", timeout=10000)
+                except:
+                    pass
+            else:
+                print(f"    No search input found, trying URL param")
+                # Try appending search query to URL
+                if "?" in base_url:
+                    search_url = base_url + "&q=" + keyword.replace(" ", "+")
+                else:
+                    search_url = base_url + "?q=" + keyword.replace(" ", "+")
+                page.goto(search_url, wait_until="networkidle", timeout=30000)
+                page.wait_for_timeout(3000)
+
+        except Exception as e:
+            print(f"    Error: {e}")
+            continue
+
+        # Extract job listings
+        try:
+            jobs = page.evaluate("""
+                () => {
+                    const results = [];
+                    const jobLinks = document.querySelectorAll('a[data-automation-id="jobTitle"]');
+                    if (jobLinks.length > 0) {
+                        for (const link of jobLinks) {
+                            results.push({
+                                title: (link.textContent || '').trim(),
+                                link: link.href || ''
+                            });
+                        }
+                        return results;
+                    }
+                    // Broader fallback
+                    const allLinks = document.querySelectorAll('a');
+                    for (const link of allLinks) {
+                        const href = link.href || '';
+                        const text = (link.textContent || '').trim();
+                        if (href.includes('/job/') && text.length > 5 && text.length < 200) {
+                            results.push({ title: text, link: href });
+                        }
                     }
                     return results;
                 }
-                // Fallback: look for job listing sections
-                const sections = document.querySelectorAll('[data-automation-id="jobResults"] li, .css-19uc56f, [class*="jobTitle"]');
-                for (const el of sections) {
-                    const a = el.querySelector('a') || el;
-                    const text = (a.textContent || '').trim();
-                    const href = a.href || '';
-                    if (text && text.length > 3 && text.length < 200) {
-                        results.push({ title: text, link: href });
-                    }
-                }
-                return results;
-            }
-        """)
-        print(f"  Workday: {len(jobs)} positions found")
-        return jobs or []
-    except Exception as e:
-        print(f"  Workday parse error: {e}")
-        return []
+            """)
+            for job in (jobs or []):
+                key = job["title"] + "|" + job.get("link", "")
+                if key not in seen_titles:
+                    seen_titles.add(key)
+                    all_jobs.append(job)
+            print(f"    Found {len(jobs or [])} positions")
+        except Exception as e:
+            print(f"    Parse error: {e}")
+
+    print(f"  Workday total: {len(all_jobs)} unique positions")
+    return all_jobs
 
 
-def scrape_icims(page, url):
-    """Extract jobs from iCIMS career sites."""
-    try:
-        page.goto(url, wait_until="networkidle", timeout=30000)
-        page.wait_for_timeout(3000)
-    except Exception as e:
-        print(f"  Error loading: {e}")
-        return []
+# ─────────────────────────────────────────────
+# iCIMS
+# ─────────────────────────────────────────────
+def scrape_icims(page, url, titles):
+    """iCIMS: search per keyword using URL params."""
+    all_jobs = []
+    seen_titles = set()
 
-    try:
-        jobs = page.evaluate("""
-            () => {
-                const results = [];
-                const links = document.querySelectorAll('.iCIMS_JobsTable a.iCIMS_Anchor, .title a, [class*="JobTitle"] a, .iCIMS_JobTitle a');
-                for (const link of links) {
-                    const text = (link.textContent || '').trim();
-                    if (text && text.length > 3) {
-                        results.push({ title: text, link: link.href || '' });
-                    }
-                }
-                if (results.length === 0) {
-                    const allLinks = document.querySelectorAll('a');
-                    for (const link of allLinks) {
-                        const href = link.href || '';
-                        const text = (link.textContent || '').trim();
-                        if (href.includes('/jobs/') && text.length > 5 && text.length < 200) {
-                            results.push({ title: text, link: href });
+    for keyword in titles:
+        print(f"    Searching: {keyword}")
+        search_url = url
+        if "?" in url:
+            search_url = url + "&ss=" + keyword.replace(" ", "+")
+        else:
+            search_url = url + "?ss=" + keyword.replace(" ", "+")
+
+        try:
+            page.goto(search_url, wait_until="networkidle", timeout=30000)
+            page.wait_for_timeout(3000)
+        except Exception as e:
+            print(f"    Error loading: {e}")
+            continue
+
+        try:
+            jobs = page.evaluate("""
+                () => {
+                    const results = [];
+                    // iCIMS job title links
+                    const selectors = [
+                        '.iCIMS_JobsTable a.iCIMS_Anchor',
+                        '.title a',
+                        '[class*="JobTitle"] a',
+                        'a[class*="job"]',
+                        'h2 a', 'h3 a'
+                    ];
+                    for (const sel of selectors) {
+                        const links = document.querySelectorAll(sel);
+                        for (const link of links) {
+                            const text = (link.textContent || '').trim();
+                            const href = link.href || '';
+                            if (text && text.length > 3 && text.length < 200 && href.includes('/jobs/')) {
+                                results.push({ title: text, link: href });
+                            }
                         }
+                        if (results.length > 0) return results;
                     }
+                    return results;
                 }
-                return results;
-            }
-        """)
-        print(f"  iCIMS: {len(jobs)} positions found")
-        return jobs or []
-    except Exception as e:
-        print(f"  iCIMS parse error: {e}")
-        return []
+            """)
+            for job in (jobs or []):
+                key = job["title"] + "|" + job.get("link", "")
+                if key not in seen_titles:
+                    seen_titles.add(key)
+                    all_jobs.append(job)
+            print(f"    Found {len(jobs or [])} positions")
+        except Exception as e:
+            print(f"    Parse error: {e}")
+
+    print(f"  iCIMS total: {len(all_jobs)} unique positions")
+    return all_jobs
 
 
-def scrape_oracle(page, url):
-    """Extract jobs from Oracle HCM / OHCM career sites."""
-    try:
-        page.goto(url, wait_until="networkidle", timeout=30000)
-        page.wait_for_timeout(5000)  # Oracle is slow
-    except Exception as e:
-        print(f"  Error loading: {e}")
-        return []
+# ─────────────────────────────────────────────
+# ORACLE HCM
+# ─────────────────────────────────────────────
+def scrape_oracle(page, url, titles):
+    """Oracle HCM: search using the search box or URL."""
+    all_jobs = []
+    seen_titles = set()
 
-    try:
-        jobs = page.evaluate("""
-            () => {
-                const results = [];
-                // Oracle HCM uses various selectors
-                const rows = document.querySelectorAll('[role="row"] a, .job-list-item a, [class*="JobTitle"], [class*="job-title"]');
-                for (const el of rows) {
-                    const text = (el.textContent || '').trim();
-                    const href = el.href || '';
-                    if (text && text.length > 3 && text.length < 200) {
-                        results.push({ title: text, link: href });
-                    }
-                }
-                if (results.length === 0) {
-                    const allLinks = document.querySelectorAll('a');
-                    for (const link of allLinks) {
-                        const href = link.href || '';
-                        const text = (link.textContent || '').trim();
-                        if ((href.includes('/job/') || href.includes('/requisition/')) && text.length > 5 && text.length < 200) {
-                            results.push({ title: text, link: href });
+    for keyword in titles:
+        print(f"    Searching: {keyword}")
+        try:
+            page.goto(url, wait_until="networkidle", timeout=30000)
+            page.wait_for_timeout(5000)
+
+            # Try to find search input
+            search_input = page.query_selector('input[type="search"]')
+            if not search_input:
+                search_input = page.query_selector('input[placeholder*="Search"]')
+            if not search_input:
+                search_input = page.query_selector('input[aria-label*="Search"]')
+            if not search_input:
+                search_input = page.query_selector('input[type="text"]')
+
+            if search_input:
+                search_input.click()
+                search_input.fill("")
+                search_input.fill(keyword)
+                page.keyboard.press("Enter")
+                page.wait_for_timeout(5000)
+                try:
+                    page.wait_for_load_state("networkidle", timeout=10000)
+                except:
+                    pass
+
+        except Exception as e:
+            print(f"    Error: {e}")
+            continue
+
+        try:
+            jobs = page.evaluate("""
+                () => {
+                    const results = [];
+                    // Oracle uses various structures
+                    const selectors = [
+                        '[role="row"] a',
+                        '.job-list-item a',
+                        'a[class*="job"]',
+                        'a[href*="/job/"]',
+                        'a[href*="/requisition/"]',
+                        'h2 a', 'h3 a',
+                        'li a'
+                    ];
+                    const seen = new Set();
+                    for (const sel of selectors) {
+                        const els = document.querySelectorAll(sel);
+                        for (const el of els) {
+                            const text = (el.textContent || '').trim();
+                            const href = el.href || '';
+                            if (text && text.length > 5 && text.length < 200 && !seen.has(text)) {
+                                seen.add(text);
+                                results.push({ title: text, link: href });
+                            }
                         }
+                        if (results.length > 0) break;
                     }
+                    return results;
                 }
-                return results;
-            }
-        """)
-        print(f"  Oracle HCM: {len(jobs)} positions found")
-        return jobs or []
-    except Exception as e:
-        print(f"  Oracle parse error: {e}")
-        return []
+            """)
+            for job in (jobs or []):
+                key = job["title"] + "|" + job.get("link", "")
+                if key not in seen_titles:
+                    seen_titles.add(key)
+                    all_jobs.append(job)
+            print(f"    Found {len(jobs or [])} positions")
+        except Exception as e:
+            print(f"    Parse error: {e}")
+
+    print(f"  Oracle total: {len(all_jobs)} unique positions")
+    return all_jobs
 
 
-def scrape_generic(page, url):
-    """Generic fallback: parse all links that look like job postings."""
+# ─────────────────────────────────────────────
+# GENERIC — for custom career sites
+# ─────────────────────────────────────────────
+def scrape_generic(page, url, titles):
+    """Generic: load the page and parse all links."""
     try:
         page.goto(url, wait_until="networkidle", timeout=30000)
         page.wait_for_timeout(3000)
@@ -285,7 +398,7 @@ def scrape_generic(page, url):
                 skip_words = ["sign in", "log in", "privacy", "cookie", "terms",
                               "contact", "about us", "home", "menu", "close",
                               "search", "filter", "clear", "reset", "back",
-                              "next", "previous", "show more"]
+                              "next", "previous", "show more", "load more"]
                 if any(sw in text.lower() for sw in skip_words):
                     continue
                 if href.startswith("/"):
@@ -300,25 +413,27 @@ def scrape_generic(page, url):
     return jobs
 
 
-def scrape_jobs(page, url):
+# ─────────────────────────────────────────────
+# ROUTER
+# ─────────────────────────────────────────────
+def scrape_jobs(page, url, titles):
     """Route to the correct scraper based on URL."""
     platform = detect_platform(url)
     print(f"  Platform: {platform}")
 
     if platform == "eightfold":
-        return scrape_eightfold(page, url)
+        return scrape_eightfold(page, url, titles)
     elif platform == "workday":
-        return scrape_workday(page, url)
+        return scrape_workday(page, url, titles)
     elif platform == "icims":
-        return scrape_icims(page, url)
+        return scrape_icims(page, url, titles)
     elif platform == "oracle":
-        return scrape_oracle(page, url)
+        return scrape_oracle(page, url, titles)
     else:
-        return scrape_generic(page, url)
+        return scrape_generic(page, url, titles)
 
 
 def matches_titles(job_title, target_titles):
-    """Check if job title matches any of the target title keywords."""
     job_lower = job_title.lower()
     for target in target_titles:
         words = target.strip().split()
@@ -339,7 +454,7 @@ def send_email(to_email, new_jobs):
             print(f"    [{job['company']}] {job['title']} -> {job['link']}")
         return
 
-    subject = f"🔔 {len(new_jobs)} New Job(s) Found!"
+    subject = f"\U0001f514 {len(new_jobs)} New Job(s) Found!"
 
     rows = ""
     for job in new_jobs:
@@ -409,7 +524,8 @@ def main():
         for company in companies:
             print(f"Scraping: {company['name']} ({company['url']})")
 
-            jobs = scrape_jobs(page, company["url"])
+            # Pass titles to scraper — platform-aware scrapers search per keyword
+            jobs = scrape_jobs(page, company["url"], titles)
 
             matched = 0
             for job in jobs:
@@ -438,7 +554,6 @@ def main():
     else:
         print("No new jobs. No notification sent.")
 
-    # Save last run timestamp
     db.collection("settings").document("last_run").set({
         "timestamp": datetime.utcnow().isoformat() + "Z",
         "jobs_found": len(new_jobs),
